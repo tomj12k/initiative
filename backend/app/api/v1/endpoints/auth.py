@@ -20,7 +20,7 @@ from app.api.deps import SessionDep, get_current_active_user, get_current_user_o
 from app.db.session import get_admin_session
 from app.core.config import settings
 from sqlmodel.ext.asyncio.session import AsyncSession
-from app.core.rate_limit import limiter
+from app.core.rate_limit import limiter, get_real_client_ip
 from app.core.encryption import decrypt_field, encrypt_field, encrypt_token, hash_email, SALT_EMAIL, SALT_OIDC_CLIENT_SECRET
 from app.core.messages import AuthMessages, OidcMessages
 from app.core.security import create_access_token, get_password_hash, verify_password
@@ -208,11 +208,31 @@ async def login_access_token(
     result = await session.exec(statement)
     user = result.one_or_none()
     if not user or not verify_password(form_data.password, user.hashed_password):
+        # Security event: emit a failed-login signal so credential stuffing is
+        # detectable (finding F2; threat model T20/T109). Log the email HASH and
+        # client IP only — never the raw email (PII; T102).
+        logger.warning(
+            "auth.login.failed email_hash=%s ip=%s",
+            hash_email(normalized_email),
+            get_real_client_ip(request),
+        )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=AuthMessages.INCORRECT_CREDENTIALS)
 
     if user.status != UserStatus.active:
+        # Valid credentials against a non-active account is a credential-stuffing
+        # signal (a confirmed email+password pair), so log it too (F2; T20/T109).
+        logger.warning(
+            "auth.login.blocked reason=inactive email_hash=%s ip=%s",
+            hash_email(normalized_email),
+            get_real_client_ip(request),
+        )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=AuthMessages.INACTIVE_USER)
     if not user.email_verified:
+        logger.warning(
+            "auth.login.blocked reason=unverified email_hash=%s ip=%s",
+            hash_email(normalized_email),
+            get_real_client_ip(request),
+        )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=AuthMessages.EMAIL_NOT_VERIFIED)
 
     access_token = create_access_token(subject=str(user.id), token_version=user.token_version)
